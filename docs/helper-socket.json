@@ -8,7 +8,7 @@
   "client": "mayfly-agent (unprivileged user 'mayfly')",
   "server": "mayfly-helper (root)",
   "impl": {
-    "canonical": ["src/protocol.rs", "src/server.rs", "src/ops.rs", "src/sshd_control.rs"],
+    "canonical": ["src/protocol.rs", "src/server.rs", "src/peercred.rs", "src/ops.rs", "src/sshd_control.rs"],
     "consumer": "mayfly-agent repo: src/ipc/{protocol.rs,client.rs} (byte-identical copy of protocol.rs)"
   },
   "duplication": "protocol.rs is duplicated byte-for-byte into mayfly-agent pending a shared crate (ADR-0009, BL-017).",
@@ -18,10 +18,11 @@
     "max_body_bytes": 1048576
   },
   "authentication": [
-    "socket file perms 0660 root:mayfly (OS-enforced: only root + mayfly group connect)",
-    "capability token: 32-byte random hex in /etc/mayfly-agent/helper.token (0640 root:mayfly), present in every request, compared constant-time",
-    "SO_PEERCRED uid pinning: planned hardening (BL-016), not yet enforced"
+    "factor 1 — socket file perms 0660 root:mayfly (OS-enforced: only root + mayfly group connect)",
+    "factor 2 — SO_PEERCRED uid pinning (Linux): kernel peer uid must be in the allow-list (MAYFLY_HELPER_ALLOWED_UID = mayfly agent uid, plus root). Fail-closed when enforced; disabled with a startup warning when MAYFLY_HELPER_ALLOWED_UID is unset (back-compat). See ADR-0011. Checked before reading the request body.",
+    "factor 3 — capability token: 32-byte random hex in /etc/mayfly-agent/helper.token (0640 root:mayfly), present in every request, compared constant-time. The helper validates the token file is a non-symlink, root-owned, mode <= 0640 before trusting it."
   ],
+  "audit_log": "one structured line per request: req_id (process-local correlation), peer_uid/gid/pid (from SO_PEERCRED), op, outcome, success, duration_ms. Never the token, file contents, or a path.",
   "request_schema": {
     "protocol_version": "integer (must equal 1)",
     "token": "string (capability token; never logged)",
@@ -53,10 +54,14 @@
     "the only external programs the helper may execute are the fixed allow-list above (ADR-0008)"
   ],
   "validation_rules": [
+    "reject peer whose SO_PEERCRED uid is not allow-listed (when enforced); fail-closed if creds unreadable",
     "reject protocol_version != 1",
-    "reject body > max_body_bytes before parsing",
+    "reject body > max_body_bytes before parsing (checked before allocation)",
     "reject missing/!= capability token (constant-time)",
+    "refuse to start if the socket path holds a non-socket file (do not clobber)",
+    "refuse to start if the token file is a symlink / not root-owned / mode > 0640",
     "ApplyTrustedCaKeys content must re-parse as a valid TrustedUserCAKeys file before any write"
   ],
+  "forward_compatibility": "request/response structs ignore unknown JSON fields; protocol_version is the explicit compatibility gate. A breaking change bumps the version and updates both this canonical copy and the mayfly-agent consumer copy together.",
   "change_policy": "Wire changes bump version and update both the canonical copy here and the mayfly-agent consumer copy together."
 }

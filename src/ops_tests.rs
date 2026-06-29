@@ -34,6 +34,12 @@ impl MockSshd {
         s
     }
 
+    fn reload_fails_once() -> Self {
+        let s = Self::healthy();
+        *s.reload_fail.lock().unwrap() = 1;
+        s
+    }
+
     fn reloads(&self) -> u32 {
         *self.reloads.lock().unwrap()
     }
@@ -61,7 +67,7 @@ impl SshdControl for MockSshd {
     fn reload(&self) -> Result<()> {
         *self.reloads.lock().unwrap() += 1;
         if take(&self.reload_fail) {
-            Err(Error::SshdInactive)
+            Err(Error::SshdReloadFailed)
         } else {
             Ok(())
         }
@@ -170,6 +176,34 @@ fn apply_rolls_back_on_validation_failure() {
 }
 
 #[test]
+fn apply_rolls_back_on_reload_failure() {
+    // A reload failure (not just a validate failure) must also restore the
+    // previous file and surface the error.
+    let h = Harness::new();
+    std::fs::create_dir_all(h.config().trusted_ca_path.parent().unwrap()).unwrap();
+    std::fs::write(&h.config().trusted_ca_path, "PREVIOUS\n").unwrap();
+
+    let ops = h.ops(MockSshd::reload_fails_once());
+    let err = ops.apply_trusted_ca_keys(&valid_ca_keys()).unwrap_err();
+    assert!(matches!(err, Error::SshdReloadFailed));
+    assert_eq!(
+        std::fs::read_to_string(h.config().trusted_ca_path).unwrap(),
+        "PREVIOUS\n"
+    );
+}
+
+#[test]
+fn apply_rollback_removes_file_when_no_previous_existed() {
+    // With no prior TrustedUserCAKeys, a failed apply must roll back to "no
+    // file" (fail-closed: no CA trust) rather than leaving a file sshd rejected.
+    let h = Harness::new();
+    let ops = h.ops(MockSshd::validate_fails_once());
+    let err = ops.apply_trusted_ca_keys(&valid_ca_keys()).unwrap_err();
+    assert!(matches!(err, Error::SshdValidationFailed));
+    assert!(!h.config().trusted_ca_path.exists());
+}
+
+#[test]
 fn apply_rejects_unparseable_content_before_writing() {
     let h = Harness::new();
     let ops = h.ops(MockSshd::healthy());
@@ -264,4 +298,64 @@ fn dispatch_apply_maps_failure_to_rolled_back_response() {
         resp.detail.as_deref(),
         Some("sshd configuration validation failed")
     );
+}
+
+#[test]
+fn install_dropin_rolls_back_to_previous_on_validation_failure() {
+    // A pre-existing (good) drop-in must be restored if a new one fails `sshd -t`.
+    let h = Harness::new();
+    h.write_main_config_with_include();
+    let cfg = h.config();
+    std::fs::create_dir_all(cfg.dropin_path.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.dropin_path, "PREVIOUS DROP-IN\n").unwrap();
+
+    let ops = h.ops(MockSshd::validate_fails_once());
+    let err = ops.install_sshd_dropin().unwrap_err();
+    assert!(matches!(err, Error::SshdValidationFailed));
+    // The previous drop-in is restored, not left replaced.
+    assert_eq!(
+        std::fs::read_to_string(&cfg.dropin_path).unwrap(),
+        "PREVIOUS DROP-IN\n"
+    );
+}
+
+#[test]
+fn install_dropin_rolls_back_to_absent_when_none_existed() {
+    // With no prior drop-in, a failed install must roll back to "no file"
+    // (fail-closed) rather than leave a drop-in sshd rejected.
+    let h = Harness::new();
+    h.write_main_config_with_include();
+    let ops = h.ops(MockSshd::reload_fails_once());
+    let err = ops.install_sshd_dropin().unwrap_err();
+    assert!(matches!(err, Error::SshdReloadFailed));
+    assert!(!h.config().dropin_path.exists());
+}
+
+#[test]
+fn verify_state_rejects_drifted_dropin_content() {
+    // An out-of-band edit to the managed drop-in is surfaced, not trusted.
+    let h = Harness::new();
+    let cfg = h.config();
+    std::fs::create_dir_all(cfg.dropin_path.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.dropin_path, "TrustedUserCAKeys /tmp/attacker\n").unwrap();
+
+    let ops = h.ops(MockSshd::healthy());
+    assert!(matches!(
+        ops.verify_state().unwrap_err(),
+        Error::SshdValidationFailed
+    ));
+}
+
+#[test]
+fn verify_state_rejects_corrupt_trusted_ca_file() {
+    let h = Harness::new();
+    let cfg = h.config();
+    std::fs::create_dir_all(cfg.trusted_ca_path.parent().unwrap()).unwrap();
+    std::fs::write(&cfg.trusted_ca_path, "ssh-dss AAAA== nope\n").unwrap();
+
+    let ops = h.ops(MockSshd::healthy());
+    assert!(matches!(
+        ops.verify_state().unwrap_err(),
+        Error::InvalidTrustedCa(_)
+    ));
 }

@@ -28,6 +28,8 @@
 //! * [`protocol`] — the agent↔helper wire types, length-prefixed framing, and
 //!   constant-time token comparison (the canonical IPC contract; see
 //!   `contracts/helper-socket.json` and ADR-0008/ADR-0009);
+//! * [`peercred`] — kernel peer-credential (`SO_PEERCRED`) uid pinning, the
+//!   third authentication factor (ADR-0011);
 //! * [`sshd_control`] — the `SshdControl` seam: the *only* place that executes
 //!   external programs (`sshd -t`, `systemctl`), behind a mockable trait;
 //! * [`ops`] — the privileged operations, built on [`security`] and an injected
@@ -55,6 +57,7 @@
 pub mod errors;
 pub mod logging;
 pub mod ops;
+pub mod peercred;
 pub mod platform;
 pub mod protocol;
 pub mod security;
@@ -65,6 +68,7 @@ pub mod sshd_control;
 
 pub use errors::{Error, Result};
 pub use ops::{HelperOps, OpsConfig};
+pub use peercred::{PeerCred, PeerPolicy};
 pub use protocol::{Operation, Outcome, Request, Response, MAX_BODY_BYTES, PROTOCOL_VERSION};
 pub use server::HelperServer;
 pub use sshd_control::{SshdControl, SshdControlConfig, SystemSshdControl};

@@ -147,22 +147,34 @@ impl<C: SshdControl> HelperOps<C> {
 
         let desired = sshd_config::render_dropin(&self.config.trusted_ca_path);
         if read_optional_string(&self.config.dropin_path)?.as_deref() == Some(desired.trim_end()) {
-            // Already current (ignoring a trailing-newline difference); still
-            // confirm sshd is healthy but skip the rewrite/reload.
+            // Already current (ignoring a trailing-newline difference): skip the
+            // rewrite and the reload. Idempotent no-op.
             return Ok(Outcome::NotModified);
         }
 
         security::ensure_not_symlink(&self.config.dropin_path)?;
+
+        // Capture the previous drop-in so a failed validate/reload can be rolled
+        // back, exactly like `apply_trusted_ca_keys`. A bad drop-in must never be
+        // left in place (fail-closed).
+        let previous = read_optional(&self.config.dropin_path)?;
         security::secure_write(
             &self.config.dropin_path,
             desired.as_bytes(),
             security::MODE_PUBLIC,
         )?;
-        self.sshd.validate_config()?;
-        self.sshd.reload()?;
-        self.sshd.is_active()?;
-        tracing::info!("installed sshd drop-in and reloaded sshd");
-        Ok(Outcome::Ok)
+
+        match self.validate_reload_verify() {
+            Ok(()) => {
+                tracing::info!("installed sshd drop-in and reloaded sshd");
+                Ok(Outcome::Ok)
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "drop-in install failed; restoring previous drop-in");
+                self.rollback_path(&self.config.dropin_path, previous.as_deref());
+                Err(err)
+            }
+        }
     }
 
     /// Atomically replace `TrustedUserCAKeys` and reload `sshd`, rolling back to
@@ -192,21 +204,38 @@ impl<C: SshdControl> HelperOps<C> {
             }
             Err(err) => {
                 tracing::error!(error = %err, "apply failed; restoring previous TrustedUserCAKeys");
-                self.rollback(previous.as_deref());
+                self.rollback_path(&self.config.trusted_ca_path, previous.as_deref());
                 Err(err)
             }
         }
     }
 
-    /// Verify the managed files' ownership/permissions and that `sshd` is
-    /// healthy.
+    /// Verify the managed state is healthy and matches expectations; fail-closed.
+    ///
+    /// Beyond ownership/permission checks this confirms the *content* is what the
+    /// helper would render: the trusted-CA file must parse, and the managed
+    /// drop-in (if present) must match the rendered directive byte-for-byte
+    /// (trailing-newline-insensitive), so an out-of-band edit is surfaced rather
+    /// than silently trusted. Finally `sshd -t` must pass and `sshd` be active.
     pub fn verify_state(&self) -> Result<()> {
-        for path in [&self.config.dropin_path, &self.config.trusted_ca_path] {
-            if read_optional(path)?.is_some() {
-                security::ensure_not_symlink(path)?;
-                security::ensure_not_group_or_world_writable(path)?;
+        if let Some(bytes) = read_optional(&self.config.trusted_ca_path)? {
+            security::ensure_not_symlink(&self.config.trusted_ca_path)?;
+            security::ensure_not_group_or_world_writable(&self.config.trusted_ca_path)?;
+            let text = String::from_utf8(bytes).map_err(|_| Error::HelperProtocol)?;
+            // Corruption / disallowed content => fail closed.
+            TrustedCaKeys::parse(&text)?;
+        }
+
+        if let Some(on_disk) = read_optional_string(&self.config.dropin_path)? {
+            security::ensure_not_symlink(&self.config.dropin_path)?;
+            security::ensure_not_group_or_world_writable(&self.config.dropin_path)?;
+            let expected = sshd_config::render_dropin(&self.config.trusted_ca_path);
+            if on_disk != expected.trim_end() {
+                tracing::error!("managed sshd drop-in does not match expected content");
+                return Err(Error::SshdValidationFailed);
             }
         }
+
         self.sshd.validate_config()?;
         self.sshd.is_active()
     }
@@ -217,18 +246,17 @@ impl<C: SshdControl> HelperOps<C> {
         self.sshd.is_active()
     }
 
-    /// Restore the previous trusted-CA file (or remove it if none existed) and
-    /// best-effort reload `sshd`. Failures here are logged; the caller has
-    /// already decided the apply failed.
-    fn rollback(&self, previous: Option<&[u8]>) {
+    /// Restore a managed file to `previous` (or remove it if none existed) and
+    /// best-effort re-validate/reload `sshd`. Used to roll back both the
+    /// trusted-CA file and the drop-in. Failures here are logged; the caller has
+    /// already decided the operation failed.
+    fn rollback_path(&self, path: &Path, previous: Option<&[u8]>) {
         let restore = match previous {
-            Some(bytes) => {
-                security::secure_write(&self.config.trusted_ca_path, bytes, security::MODE_PUBLIC)
-            }
-            None => remove_optional(&self.config.trusted_ca_path),
+            Some(bytes) => security::secure_write(path, bytes, security::MODE_PUBLIC),
+            None => remove_optional(path),
         };
         if let Err(err) = restore {
-            tracing::error!(error = %err, "failed to restore previous TrustedUserCAKeys during rollback");
+            tracing::error!(error = %err, "failed to restore previous file during rollback");
             return;
         }
         if let Err(err) = self.validate_reload_verify() {

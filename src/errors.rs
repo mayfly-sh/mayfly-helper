@@ -67,10 +67,21 @@ pub enum Error {
     #[error("helper rejected the request: unauthenticated")]
     HelperUnauthenticated,
 
+    /// The kernel peer credentials of a connecting client could not be read
+    /// (`SO_PEERCRED`). Treated as fail-closed when uid pinning is enforced.
+    #[error("could not read socket peer credentials")]
+    PeerCredUnavailable,
+
     /// `sshd -t` rejected the candidate configuration. The offending detail is
     /// logged, never included here.
     #[error("sshd configuration validation failed")]
     SshdValidationFailed,
+
+    /// Reloading `sshd` (via the service manager) failed, or did not complete
+    /// within the configured timeout. Distinct from [`Self::SshdInactive`] so an
+    /// audit log can tell a failed reload apart from an inactive service.
+    #[error("sshd reload failed")]
+    SshdReloadFailed,
 
     /// `sshd` was not active after a reload, or the service query failed.
     #[error("sshd is not active")]
@@ -135,7 +146,9 @@ mod tests {
             Error::HelperUnavailable,
             Error::HelperProtocol,
             Error::HelperUnauthenticated,
+            Error::PeerCredUnavailable,
             Error::SshdValidationFailed,
+            Error::SshdReloadFailed,
             Error::SshdInactive,
         ];
         for err in errors {

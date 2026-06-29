@@ -23,6 +23,10 @@ RuntimeDirectoryMode=2750
 
 Environment=MAYFLY_HELPER_SOCKET_PATH=/run/mayfly/helper.sock
 Environment=MAYFLY_HELPER_TOKEN_PATH=/etc/mayfly-agent/helper.token
+# Written by install.sh: MAYFLY_HELPER_ALLOWED_UID=<mayfly agent uid> for
+# SO_PEERCRED uid pinning. Optional (leading '-') so the helper still starts
+# (with pinning disabled + a warning) if the file is absent.
+EnvironmentFile=-/etc/mayfly-agent/helper.env
 
 # --- Hardening -------------------------------------------------------------
 # The helper legitimately needs to write the SSH trust files and talk to the
@@ -30,8 +34,10 @@ Environment=MAYFLY_HELPER_TOKEN_PATH=/etc/mayfly-agent/helper.token
 # explicit ReadWritePaths for the SSH config it manages.
 NoNewPrivileges=yes
 ProtectSystem=full
-ReadWritePaths=/etc/ssh /etc/ssh/sshd_config.d
+ReadWritePaths=/etc/ssh
 ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -43,15 +49,23 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+KeyringMode=private
+# Files the helper creates (socket, drop-in, trust file) get tight perms by
+# default; the helper widens the socket to 0660 explicitly.
+UMask=0077
 # Only Unix sockets are needed for the local control socket.
 RestrictAddressFamilies=AF_UNIX
+# The helper performs NO IP networking (control socket is AF_UNIX; systemctl
+# talks to systemd over a Unix socket). Deny all IP traffic outright.
+IPAddressDeny=any
 SystemCallArchitectures=native
 # Curated allow-list. We deliberately do NOT add ~@privileged here: the helper
 # is root and must drive the service manager (systemctl reload/is-active);
-# over-filtering would break the reload path. @resources is denied as the helper
-# never tunes them.
+# over-filtering would break the reload path. The groups denied below are never
+# used by the helper (it only writes files and execs sshd -t / systemctl).
 SystemCallFilter=@system-service
-SystemCallFilter=~@resources
+SystemCallFilter=~@resources @obsolete @reboot @swap @mount @raw-io @cpu-emulation @debug
 
 [Install]
 WantedBy=multi-user.target

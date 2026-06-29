@@ -14,6 +14,7 @@ set -euo pipefail
 readonly HELPER_BIN_DEST="${MAYFLY_HELPER_BIN_DEST:-/usr/local/sbin/mayfly-helper}"
 readonly CONFIG_DIR="/etc/mayfly-agent"
 readonly TOKEN_FILE="$CONFIG_DIR/helper.token"
+readonly ENV_FILE="$CONFIG_DIR/helper.env"
 readonly SSH_CA_DIR="/etc/ssh/mayfly"
 readonly DROPIN_FILE="/etc/ssh/sshd_config.d/90-mayfly.conf"
 readonly UNIT_DIR="/etc/systemd/system"
@@ -53,6 +54,7 @@ purge_ssh() {
     fi
   fi
   rm -f "$TOKEN_FILE"
+  rm -f "$ENV_FILE"
   rm -rf "$SSH_CA_DIR"
 }
 

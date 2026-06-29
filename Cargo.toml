@@ -35,8 +35,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "json",
     "registry",
 ] }
-# Only the `process` feature is needed (geteuid); no `system`/uname here.
-rustix = { version = "1", features = ["process"] }
+# `process` for geteuid/getuid; `net` for SO_PEERCRED peer-credential auth on
+# the Unix socket (Linux). Both are pure-Rust FFI bindings — no C TLS stack.
+rustix = { version = "1", features = ["process", "net"] }
 tempfile = "3"
 # Async-signal-safe SIGINT/SIGTERM handling for graceful shutdown. Pure-Rust
 # (FFI bindings only); the registered handler only sets an AtomicBool.

@@ -25,6 +25,7 @@ readonly MAYFLY_GROUP="mayfly"
 readonly HELPER_BIN_DEST="${MAYFLY_HELPER_BIN_DEST:-/usr/local/sbin/mayfly-helper}"
 readonly CONFIG_DIR="/etc/mayfly-agent"
 readonly TOKEN_FILE="$CONFIG_DIR/helper.token"
+readonly ENV_FILE="$CONFIG_DIR/helper.env"
 readonly STATE_DIR="/var/lib/mayfly"
 readonly SSH_CA_DIR="/etc/ssh/mayfly"
 readonly DROPIN_DIR="/etc/ssh/sshd_config.d"
@@ -100,6 +101,19 @@ generate_token() {
   chmod 0640 "$TOKEN_FILE"
 }
 
+write_env_file() {
+  # Pin the helper's SO_PEERCRED uid allow-list to the mayfly agent's uid so
+  # only that process (and root) can drive privileged operations, even within
+  # the mayfly group. Regenerated each install to stay correct after a uid change.
+  local uid
+  uid="$(id -u "$MAYFLY_USER")" || die "could not resolve uid for $MAYFLY_USER"
+  log "pinning helper peer uid to $uid (MAYFLY_HELPER_ALLOWED_UID)"
+  umask 077
+  printf 'MAYFLY_HELPER_ALLOWED_UID=%s\n' "$uid" > "$ENV_FILE"
+  chown root:"$MAYFLY_GROUP" "$ENV_FILE"
+  chmod 0640 "$ENV_FILE"
+}
+
 install_sshd_dropin() {
   log "installing sshd drop-in"
   install -o root -g root -m 0644 "$SCRIPT_DIR/sshd/90-mayfly.conf" "$DROPIN_FILE"
@@ -136,6 +150,7 @@ main() {
   create_directories
   install_binary
   generate_token
+  write_env_file
   install_sshd_dropin
   install_unit
   start_service

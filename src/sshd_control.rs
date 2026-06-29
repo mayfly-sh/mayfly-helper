@@ -9,9 +9,29 @@
 //! so the privileged [`crate::ops`] are fully testable with a mock.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::errors::{Error, Result};
+
+/// Default wall-clock bound for a single privileged sub-command (`sshd -t`,
+/// `systemctl reload`/`is-active`). A hung child is killed and treated as a
+/// failure so it can never pin the single-threaded helper loop.
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the runner polls a spawned child for completion.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The result of running one fixed sub-command to completion (or killing it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// The command exited 0.
+    Success,
+    /// The command exited non-zero or could not be spawned.
+    Failed,
+    /// The command did not finish within the timeout and was killed.
+    TimedOut,
+}
 
 /// Abstraction over validating, reloading, and probing `sshd`.
 pub trait SshdControl: Send + Sync {
@@ -51,6 +71,9 @@ pub struct SshdControlConfig {
     pub systemctl_binary: PathBuf,
     /// The `sshd` service/unit name (e.g. `ssh` or `sshd`).
     pub service_name: String,
+    /// Wall-clock bound for each sub-command; a child exceeding it is killed and
+    /// the operation fails (fail-closed). See [`DEFAULT_COMMAND_TIMEOUT`].
+    pub command_timeout: Duration,
 }
 
 impl Default for SshdControlConfig {
@@ -59,6 +82,7 @@ impl Default for SshdControlConfig {
             sshd_binary: PathBuf::from("/usr/sbin/sshd"),
             systemctl_binary: PathBuf::from("/usr/bin/systemctl"),
             service_name: "ssh".to_string(),
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
         }
     }
 }
@@ -80,6 +104,12 @@ impl SshdControlConfig {
         if let Some(v) = get_env("MAYFLY_HELPER_SERVICE_NAME") {
             cfg.service_name = v;
         }
+        if let Some(secs) = get_env("MAYFLY_HELPER_SSHD_TIMEOUT_SECS")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&s| s > 0)
+        {
+            cfg.command_timeout = Duration::from_secs(secs);
+        }
         cfg
     }
 }
@@ -99,26 +129,76 @@ impl SystemSshdControl {
         Self { config }
     }
 
-    /// Run a fixed command and return whether it exited successfully, logging
-    /// (but never returning) its captured output for diagnostics.
-    fn run(&self, command: &mut Command, what: &str) -> bool {
-        match command.output() {
-            Ok(output) if output.status.success() => true,
-            Ok(output) => {
-                tracing::warn!(
-                    command = what,
-                    code = output.status.code(),
-                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                    "privileged command reported failure"
-                );
-                false
-            }
+    /// Run a fixed command to completion under [`SshdControlConfig::command_timeout`],
+    /// returning a coarse [`RunOutcome`] and logging (but never returning) its
+    /// captured stderr for diagnostics.
+    ///
+    /// The command is spawned with stdout discarded and stderr captured. A child
+    /// that overruns the timeout is killed and reaped so it cannot become a
+    /// zombie or pin the helper's single-threaded accept loop.
+    fn run(&self, command: &mut Command, what: &str) -> RunOutcome {
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
             Err(err) => {
-                tracing::warn!(command = what, error = %err, "failed to execute privileged command");
-                false
+                tracing::warn!(command = what, error = %err, "failed to spawn privileged command");
+                return RunOutcome::Failed;
+            }
+        };
+
+        let deadline = Instant::now() + self.config.command_timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stderr = read_child_stderr(&mut child);
+                    if status.success() {
+                        return RunOutcome::Success;
+                    }
+                    tracing::warn!(
+                        command = what,
+                        code = status.code(),
+                        stderr = %stderr.trim(),
+                        "privileged command reported failure"
+                    );
+                    return RunOutcome::Failed;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // Fail-closed: kill and reap a child that overran the bound.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        tracing::warn!(
+                            command = what,
+                            timeout_secs = self.config.command_timeout.as_secs(),
+                            timed_out = true,
+                            "privileged command timed out; killed"
+                        );
+                        return RunOutcome::TimedOut;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!(command = what, error = %err, "error while awaiting privileged command");
+                    return RunOutcome::Failed;
+                }
             }
         }
     }
+}
+
+/// Drain a finished child's captured stderr (best-effort, for diagnostics only).
+fn read_child_stderr(child: &mut std::process::Child) -> String {
+    use std::io::Read as _;
+    let mut buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut buf);
+    }
+    buf
 }
 
 impl SshdControl for SystemSshdControl {
@@ -127,30 +207,28 @@ impl SshdControl for SystemSshdControl {
         // drop-ins pulled in via `Include`.
         let mut cmd = Command::new(&self.config.sshd_binary);
         cmd.arg("-t");
-        if self.run(&mut cmd, "sshd -t") {
-            Ok(())
-        } else {
-            Err(Error::SshdValidationFailed)
+        match self.run(&mut cmd, "sshd -t") {
+            RunOutcome::Success => Ok(()),
+            // A timeout or a non-zero exit are both "config not known-good".
+            RunOutcome::Failed | RunOutcome::TimedOut => Err(Error::SshdValidationFailed),
         }
     }
 
     fn reload(&self) -> Result<()> {
         let mut cmd = Command::new(&self.config.systemctl_binary);
         cmd.arg("reload").arg(&self.config.service_name);
-        if self.run(&mut cmd, "systemctl reload") {
-            Ok(())
-        } else {
-            Err(Error::SshdInactive)
+        match self.run(&mut cmd, "systemctl reload") {
+            RunOutcome::Success => Ok(()),
+            RunOutcome::Failed | RunOutcome::TimedOut => Err(Error::SshdReloadFailed),
         }
     }
 
     fn is_active(&self) -> Result<()> {
         let mut cmd = Command::new(&self.config.systemctl_binary);
         cmd.arg("is-active").arg(&self.config.service_name);
-        if self.run(&mut cmd, "systemctl is-active") {
-            Ok(())
-        } else {
-            Err(Error::SshdInactive)
+        match self.run(&mut cmd, "systemctl is-active") {
+            RunOutcome::Success => Ok(()),
+            RunOutcome::Failed | RunOutcome::TimedOut => Err(Error::SshdInactive),
         }
     }
 }
@@ -166,6 +244,7 @@ mod tests {
             sshd_binary: PathBuf::from("/nonexistent/sshd"),
             systemctl_binary: PathBuf::from("/nonexistent/systemctl"),
             service_name: "ssh".to_string(),
+            command_timeout: Duration::from_secs(5),
         })
     }
 
@@ -183,7 +262,8 @@ mod tests {
     #[test]
     fn reload_and_is_active_fail_when_binary_missing() {
         let c = control_with_missing_binaries();
-        assert!(matches!(c.reload().unwrap_err(), Error::SshdInactive));
+        // A failed reload is now typed distinctly from an inactive service.
+        assert!(matches!(c.reload().unwrap_err(), Error::SshdReloadFailed));
         assert!(matches!(c.is_active().unwrap_err(), Error::SshdInactive));
     }
 
@@ -192,10 +272,76 @@ mod tests {
         let cfg = SshdControlConfig::from_env(|k| match k {
             "MAYFLY_HELPER_SERVICE_NAME" => Some("sshd".to_string()),
             "MAYFLY_HELPER_SSHD_BINARY" => Some("/usr/local/sbin/sshd".to_string()),
+            "MAYFLY_HELPER_SSHD_TIMEOUT_SECS" => Some("42".to_string()),
             _ => None,
         });
         assert_eq!(cfg.service_name, "sshd");
         assert_eq!(cfg.sshd_binary, PathBuf::from("/usr/local/sbin/sshd"));
         assert_eq!(cfg.systemctl_binary, PathBuf::from("/usr/bin/systemctl"));
+        assert_eq!(cfg.command_timeout, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn from_env_ignores_zero_and_garbage_timeout() {
+        let cfg = SshdControlConfig::from_env(|k| match k {
+            "MAYFLY_HELPER_SSHD_TIMEOUT_SECS" => Some("0".to_string()),
+            _ => None,
+        });
+        assert_eq!(cfg.command_timeout, DEFAULT_COMMAND_TIMEOUT);
+        let cfg = SshdControlConfig::from_env(|k| match k {
+            "MAYFLY_HELPER_SSHD_TIMEOUT_SECS" => Some("not-a-number".to_string()),
+            _ => None,
+        });
+        assert_eq!(cfg.command_timeout, DEFAULT_COMMAND_TIMEOUT);
+    }
+
+    /// A command that exits immediately succeeds within the timeout. Uses
+    /// `/usr/bin/true` (or `/bin/true`), present on Linux and macOS dev hosts.
+    #[test]
+    fn run_returns_success_for_fast_command() {
+        let true_bin = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(true_bin) = true_bin else {
+            return; // No `true` binary available; skip rather than fail.
+        };
+        let control = SystemSshdControl::new(SshdControlConfig {
+            sshd_binary: true_bin,
+            systemctl_binary: PathBuf::from("/nonexistent"),
+            service_name: "ssh".to_string(),
+            command_timeout: Duration::from_secs(5),
+        });
+        // `validate_config` runs `<sshd_binary> -t`; `true` ignores args and
+        // exits 0, so this exercises the success path deterministically.
+        assert!(control.validate_config().is_ok());
+    }
+
+    /// A command that overruns the timeout is killed and reported as
+    /// [`RunOutcome::TimedOut`] (fail-closed). Deterministic: `sleep 30` cannot
+    /// finish inside 150ms, and the runner returns promptly after the kill.
+    #[test]
+    fn run_times_out_and_kills_overrunning_command() {
+        let sleep_bin = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+        let Some(sleep_bin) = sleep_bin else {
+            return; // No `sleep` binary available; skip rather than fail.
+        };
+        let control = SystemSshdControl::new(SshdControlConfig {
+            sshd_binary: PathBuf::from("/nonexistent"),
+            systemctl_binary: PathBuf::from("/nonexistent"),
+            service_name: "ssh".to_string(),
+            command_timeout: Duration::from_millis(150),
+        });
+        // Call the private runner directly with a clean `sleep 30`.
+        let mut cmd = Command::new(&sleep_bin);
+        cmd.arg("30");
+        let started = Instant::now();
+        let outcome = control.run(&mut cmd, "sleep 30 (test)");
+        assert_eq!(outcome, RunOutcome::TimedOut);
+        // It returned promptly (killed), not after the full 30s sleep.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
