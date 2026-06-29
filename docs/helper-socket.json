@@ -1,0 +1,62 @@
+{
+  "contract": "helper-socket",
+  "version": 1,
+  "kind": "intra-host-ipc",
+  "owner": "mayfly-helper",
+  "note": "Canonical specification of the Mayfly agent<->helper IPC. LOCAL Unix Domain Socket protocol, NOT a network wire protocol. Owned by mayfly-helper; consumed by mayfly-agent. See docs/ADR-0008 and docs/ADR-0009.",
+  "endpoint": "AF_UNIX SOCK_STREAM at /run/mayfly/helper.sock (mode 0660, owner root:mayfly)",
+  "client": "mayfly-agent (unprivileged user 'mayfly')",
+  "server": "mayfly-helper (root)",
+  "impl": {
+    "canonical": ["src/protocol.rs", "src/server.rs", "src/ops.rs", "src/sshd_control.rs"],
+    "consumer": "mayfly-agent repo: src/ipc/{protocol.rs,client.rs} (byte-identical copy of protocol.rs)"
+  },
+  "duplication": "protocol.rs is duplicated byte-for-byte into mayfly-agent pending a shared crate (ADR-0009, BL-017).",
+  "framing": {
+    "length_prefix": "u32 big-endian byte length of the JSON body",
+    "body": "compact JSON (serde_json)",
+    "max_body_bytes": 1048576
+  },
+  "authentication": [
+    "socket file perms 0660 root:mayfly (OS-enforced: only root + mayfly group connect)",
+    "capability token: 32-byte random hex in /etc/mayfly-agent/helper.token (0640 root:mayfly), present in every request, compared constant-time",
+    "SO_PEERCRED uid pinning: planned hardening (BL-016), not yet enforced"
+  ],
+  "request_schema": {
+    "protocol_version": "integer (must equal 1)",
+    "token": "string (capability token; never logged)",
+    "op": "one of: Ping | EnsureDirectories | InstallSshdDropin | ApplyTrustedCaKeys | VerifyState",
+    "content": "string (ApplyTrustedCaKeys only): the full rendered TrustedUserCAKeys file body"
+  },
+  "response_schema": {
+    "ok": "boolean",
+    "outcome": "string enum: ok | applied | rolled_back | not_modified | unhealthy",
+    "helper_version": "string (Ping)",
+    "detail": "string | null: fixed, non-sensitive reason; never a path/secret/token"
+  },
+  "operations": {
+    "Ping": "liveness; returns helper_version",
+    "EnsureDirectories": "create /etc/ssh/mayfly (0755 root) and verify perms/ownership",
+    "InstallSshdDropin": "atomically write /etc/ssh/sshd_config.d/90-mayfly.conf (TrustedUserCAKeys directive), detect missing Include, sshd -t, reload",
+    "ApplyTrustedCaKeys": "atomic replace of /etc/ssh/mayfly/trusted_user_ca_keys: validate content -> temp+fsync+rename -> sshd -t -> reload -> verify; rollback to previous on any failure",
+    "VerifyState": "verify drop-in + trusted-CA perms/ownership; sshd -t; sshd active"
+  },
+  "privileged_exec_allowlist": [
+    "/usr/sbin/sshd -t",
+    "systemctl reload <service>",
+    "systemctl is-active <service>"
+  ],
+  "security_invariants": [
+    "requests map 1:1 to explicit ops; NO generic filesystem API; NO arbitrary command op",
+    "helper never returns file contents, paths, tokens, or secrets in responses or logs",
+    "fail-closed: an apply that cannot be validated/reloaded rolls back; never leaves invalid sshd config",
+    "the only external programs the helper may execute are the fixed allow-list above (ADR-0008)"
+  ],
+  "validation_rules": [
+    "reject protocol_version != 1",
+    "reject body > max_body_bytes before parsing",
+    "reject missing/!= capability token (constant-time)",
+    "ApplyTrustedCaKeys content must re-parse as a valid TrustedUserCAKeys file before any write"
+  ],
+  "change_policy": "Wire changes bump version and update both the canonical copy here and the mayfly-agent consumer copy together."
+}
