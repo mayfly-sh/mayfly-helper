@@ -127,6 +127,18 @@ mod tests {
         assert_eq!(line, "TrustedUserCAKeys /etc/ssh/mayfly_ca.pub");
     }
 
+    /// The shipped deploy drop-in MUST equal what the helper renders for the
+    /// default managed path. `verify_state` compares the on-disk drop-in to
+    /// `render_dropin` byte-for-byte (newline-insensitive), so any drift between
+    /// the bootstrap asset and the renderer would make VerifyState fail on a
+    /// freshly provisioned host. This pins them together.
+    #[test]
+    fn deploy_dropin_asset_matches_rendered() {
+        let asset = include_str!("../../deploy/sshd/90-mayfly.conf");
+        let rendered = render_dropin(Path::new("/etc/ssh/mayfly/trusted_user_ca_keys"));
+        assert_eq!(asset.trim_end(), rendered.trim_end());
+    }
+
     #[test]
     fn finds_directive_value() {
         let text = "Port 22\nTrustedUserCAKeys /etc/ssh/mayfly_ca.pub\n";
