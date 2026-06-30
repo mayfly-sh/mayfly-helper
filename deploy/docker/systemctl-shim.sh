@@ -10,10 +10,20 @@ set -euo pipefail
 
 action="${1:-}"
 
+# Test-only fault injection (milestone 010D): when this sentinel exists, every
+# `reload` fails WITHOUT signalling sshd, so the helper's safe-reload path takes
+# its rollback branch deterministically. Production never creates this file; the
+# integration provisioner writes it only when MAYFLY_INJECT_RELOAD_FAIL=1.
+RELOAD_FAIL_SENTINEL="${MAYFLY_INJECT_RELOAD_FAIL_SENTINEL:-/run/mayfly/inject/reload-fail}"
+
 sshd_pid() { pgrep -x sshd | head -n1; }
 
 case "$action" in
   reload)
+    if [ -e "$RELOAD_FAIL_SENTINEL" ]; then
+      echo "systemctl-shim: reload failure injected (sentinel present)" >&2
+      exit 1
+    fi
     pid="$(sshd_pid || true)"
     [ -n "$pid" ] || { echo "sshd not running" >&2; exit 1; }
     kill -HUP "$pid"
